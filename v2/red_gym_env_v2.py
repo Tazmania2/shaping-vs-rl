@@ -1,6 +1,7 @@
 import uuid
 import json
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from skimage.transform import downscale_local_mean
@@ -14,14 +15,16 @@ from gymnasium import Env, spaces
 from pyboy.utils import WindowEvent
 
 from global_map import local_to_global, GLOBAL_MAP_SHAPE
+from shaping_trainer import ShapingTrainer
 
 event_flags_start = 0xD747
 event_flags_end = 0xD87E # expand for SS Anne # old - 0xD7F6 
 museum_ticket = (0xD754, 0)
 
 class RedGymEnv(Env):
-    def __init__(self, config=None):
+    def __init__(self, config=None, shaping_trainer: Optional[ShapingTrainer] = None):
         self.s_path = config["session_path"]
+        self.shaping_trainer = shaping_trainer
         self.save_final_state = config["save_final_state"]
         self.print_rewards = config["print_rewards"]
         self.headless = config["headless"]
@@ -161,6 +164,8 @@ class RedGymEnv(Env):
         self.max_map_progress = 0
         self.progress_reward = self.get_game_state_reward()
         self.total_reward = sum([val for _, val in self.progress_reward.items()])
+        if self.shaping_trainer is not None:
+            self.shaping_trainer.reset_episode()
         self.reset_count += 1
         return self._get_obs(), {}
 
@@ -216,7 +221,7 @@ class RedGymEnv(Env):
 
         self.party_size = self.read_m(0xD163)
 
-        new_reward = self.update_reward()
+        new_reward, reward_info = self.update_reward()
 
         self.last_health = self.read_hp_fraction()
 
@@ -242,9 +247,17 @@ class RedGymEnv(Env):
                         else:
                             print(f"could not find key: {key}")
 
+        if self.shaping_trainer is not None:
+            flags = {k: v > 0 for k, v in reward_info.items()}
+            reward = self.shaping_trainer.get_shaped_reward(flags)
+            info = reward_info
+        else:
+            reward = new_reward
+            info = {}
+
         self.step_count += 1
 
-        return obs, new_reward, False, step_limit_reached, {}
+        return obs, reward, False, step_limit_reached, info
     
     def run_action_on_emulator(self, action):
         # press button then release after some steps
@@ -386,15 +399,18 @@ class RedGymEnv(Env):
         self.recent_actions[0] = action
 
     def update_reward(self):
-        # compute reward
+        # compute reward and per-component deltas
+        old_scores = self.progress_reward
         self.progress_reward = self.get_game_state_reward()
-        new_total = sum(
-            [val for _, val in self.progress_reward.items()]
-        )
+        deltas = {
+            k: self.progress_reward[k] - old_scores.get(k, 0.0)
+            for k in self.progress_reward
+        }
+        new_total = sum(val for val in self.progress_reward.values())
         new_step = new_total - self.total_reward
 
         self.total_reward = new_total
-        return new_step
+        return new_step, deltas
 
     def group_rewards(self):
         prog = self.progress_reward
